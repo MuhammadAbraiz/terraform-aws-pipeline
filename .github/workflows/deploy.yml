@@ -1,0 +1,201 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "site/**"
+  workflow_dispatch:
+
+permissions: {}
+
+# One production run at a time. Never cancel a running apply.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+env:
+  TF_VERSION: 1.17.2
+  CHECKOV_VERSION: 3.4.10
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  MAX_PLAN_AGE_SECONDS: 86400
+
+jobs:
+  plan:
+    name: plan + scan plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+      plan_key: ${{ steps.store.outputs.plan_key }}
+      plan_sha256: ${{ steps.store.outputs.plan_sha256 }}
+      plan_created_at: ${{ steps.store.outputs.plan_created_at }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: AWS credentials (plan role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.PLAN_ROLE_ARN }}
+          role-session-name: tfpipe-main-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
+
+      - name: terraform init
+        working-directory: infra
+        env:
+          STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: terraform init -no-color -lockfile=readonly -backend-config="bucket=${STATE_BUCKET}" > /dev/null
+
+      - name: terraform plan
+        id: plan
+        working-directory: infra
+        run: |
+          set +e
+          terraform plan -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan > ../plan.log 2>&1
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::terraform plan failed"
+               grep -A3 -E '^(Error|│ Error)' ../plan.log | head -n 20
+               exit "$code" ;;
+          esac
+          terraform show -json tfplan > ../tfplan.json
+          grep -E '^(Plan:|No changes)' ../plan.log || true
+
+      # The plan that gets applied is scanned too, not only the PR plan.
+      - name: Checkov (plan)
+        id: checkov
+        run: |
+          pipx install "checkov==${CHECKOV_VERSION}" > /dev/null
+          set +e
+          checkov -f tfplan.json --framework terraform_plan \
+            --repo-root-for-plan-enrichment infra \
+            --quiet --compact -o json > checkov.json 2> checkov.err
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Summary for the approver
+        run: |
+          bash scripts/plan-summary.sh tfplan.json checkov.json "main" "$GITHUB_SHA" > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Block on Checkov findings
+        if: steps.checkov.outputs.exit != '0'
+        run: |
+          echo "::error::Checkov found failed checks in the plan. Nothing will be applied."
+          exit 1
+
+      # Saved plans hold cleartext values, so they go to the private state
+      # bucket (expires after a day), never to a public GitHub artifact.
+      - name: Store the plan
+        id: store
+        if: steps.plan.outputs.has_changes == 'true'
+        env:
+          STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: |
+          key="plans/production/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/tfplan"
+          sha=$(sha256sum infra/tfplan | cut -d' ' -f1)
+          aws s3 cp infra/tfplan "s3://${STATE_BUCKET}/${key}" --only-show-errors
+          {
+            echo "plan_key=${key}"
+            echo "plan_sha256=${sha}"
+            echo "plan_created_at=$(date -u +%s)"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo
+            echo "**Plan SHA-256:** \`${sha}\`"
+            echo
+            echo "Approve the **production** deployment to apply exactly this plan."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: apply
+    needs: plan
+    if: needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    # Waits here for a required reviewer. The apply role only trusts this
+    # environment on main, and its ARN is an environment secret.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: AWS credentials (apply role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.APPLY_ROLE_ARN }}
+          role-session-name: tfpipe-apply-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
+
+      - name: terraform init
+        working-directory: infra
+        env:
+          STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: terraform init -no-color -lockfile=readonly -backend-config="bucket=${STATE_BUCKET}" > /dev/null
+
+      - name: Fetch and verify the approved plan
+        working-directory: infra
+        env:
+          STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          PLAN_KEY: ${{ needs.plan.outputs.plan_key }}
+          PLAN_SHA256: ${{ needs.plan.outputs.plan_sha256 }}
+          PLAN_CREATED_AT: ${{ needs.plan.outputs.plan_created_at }}
+        run: |
+          age=$(( $(date -u +%s) - PLAN_CREATED_AT ))
+          if [ "$age" -gt "$MAX_PLAN_AGE_SECONDS" ]; then
+            echo "::error::The plan is ${age}s old. Re-run the workflow for a fresh plan and approval."
+            exit 1
+          fi
+          aws s3 cp "s3://${STATE_BUCKET}/${PLAN_KEY}" tfplan --only-show-errors
+          echo "${PLAN_SHA256}  tfplan" | sha256sum -c -
+
+      - name: terraform apply
+        working-directory: infra
+        run: |
+          set +e
+          terraform apply -no-color -lock-timeout=5m tfplan > ../apply.log 2>&1
+          code=$?
+          set -e
+          grep -A3 -E '^(Apply complete|Error|│ Error)' ../apply.log || true
+          exit "$code"
+
+      - name: Smoke test
+        working-directory: infra
+        run: |
+          url=$(terraform output -raw site_url)
+          status=$(curl -sS -o /dev/null -w '%{http_code}' --retry 20 --retry-delay 15 --retry-all-errors "$url/")
+          echo "GET $url/ -> $status"
+          {
+            echo "### Deployed"
+            echo
+            echo "| Site | Status |"
+            echo "| --- | --- |"
+            echo "| $url | $status |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$status" = "200" ]
