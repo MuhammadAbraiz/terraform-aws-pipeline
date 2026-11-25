@@ -1,0 +1,17 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+tfplan.json
+crash.log
+*.tfvars
+!example.tfvars
+
+# Pipeline scratch files
+plan.log
+apply.log
+checkov.json
+checkov.err
+summary.md
