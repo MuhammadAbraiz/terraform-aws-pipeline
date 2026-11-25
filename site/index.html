@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>terraform-aws-pipeline</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0f172a; color: #e2e8f0; }
+    main { max-width: 560px; padding: 40px; }
+    .tag { display: inline-block; font-size: 13px; padding: 4px 12px; border: 1px solid #f59e0b; color: #f59e0b; border-radius: 999px; }
+    h1 { font-size: 34px; line-height: 1.2; margin: 18px 0 12px; }
+    p { color: #94a3b8; line-height: 1.6; }
+    ol { color: #cbd5e1; line-height: 1.9; padding-left: 20px; }
+    code { background: #1e293b; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="tag">Deployed by an approved Terraform plan</span>
+    <h1>Pull requests can plan.<br>Only main can apply.</h1>
+    <p>This page is served from a private S3 bucket through CloudFront. It reached AWS only after these steps passed:</p>
+    <ol>
+      <li><code>terraform plan</code> with a read-only role</li>
+      <li>Checkov scan of the plan</li>
+      <li>Manual approval in the <code>production</code> environment</li>
+      <li><code>terraform apply</code> of that exact plan</li>
+    </ol>
+    <p>Source: github.com/MuhammadAbraiz/terraform-aws-pipeline</p>
+  </main>
+</body>
+</html>
