@@ -1,0 +1,158 @@
+name: pr
+
+on:
+  pull_request:
+    branches: [main]
+
+# Nothing by default. Each job asks for what it needs.
+permissions: {}
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: 1.17.2
+  CHECKOV_VERSION: 3.4.10
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  checks:
+    name: fmt, validate, scan code
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        working-directory: infra
+        run: |
+          terraform init -backend=false -lockfile=readonly -no-color > /dev/null
+          terraform validate -no-color
+
+      - name: Checkov (code)
+        run: |
+          pipx install "checkov==${CHECKOV_VERSION}" > /dev/null
+          checkov -d infra --framework terraform --compact --quiet
+
+  plan:
+    name: plan + scan plan
+    needs: checks
+    # Fork PRs get no OIDC token anyway. This makes the rule explicit.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: AWS credentials (plan role)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.PLAN_ROLE_ARN }}
+          role-session-name: tfpipe-pr-${{ github.run_id }}-${{ github.run_attempt }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          mask-aws-account-id: true
+
+      - name: terraform init
+        working-directory: infra
+        env:
+          STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+        run: terraform init -no-color -lockfile=readonly -backend-config="bucket=${STATE_BUCKET}" > /dev/null
+
+      # The raw plan goes to a file, never to the public log.
+      - name: terraform plan
+        working-directory: infra
+        run: |
+          set +e
+          terraform plan -no-color -lock-timeout=5m -out=tfplan > ../plan.log 2>&1
+          code=$?
+          set -e
+          if [ "$code" -ne 0 ]; then
+            echo "::error::terraform plan failed"
+            grep -A3 -E '^(Error|│ Error)' ../plan.log | head -n 20
+            exit "$code"
+          fi
+          terraform show -json tfplan > ../tfplan.json
+          grep -E '^(Plan:|No changes)' ../plan.log || true
+
+      - name: Checkov (plan)
+        id: checkov
+        run: |
+          pipx install "checkov==${CHECKOV_VERSION}" > /dev/null
+          set +e
+          checkov -f tfplan.json --framework terraform_plan \
+            --repo-root-for-plan-enrichment infra \
+            --quiet --compact -o json > checkov.json 2> checkov.err
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          bash scripts/plan-summary.sh tfplan.json checkov.json "PR #${PR_NUMBER}" "$HEAD_SHA" > summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plan-summary
+          path: summary.md
+          retention-days: 1
+
+      - name: Fail on Checkov findings
+        if: steps.checkov.outputs.exit != '0'
+        run: |
+          echo "::error::Checkov found failed checks in the plan. See the PR comment."
+          exit 1
+
+  comment:
+    name: PR comment
+    needs: plan
+    if: always() && needs.plan.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: plan-summary
+
+      # One comment per PR, updated in place on every push.
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- tfpipe-plan -->';
+            const body = fs.readFileSync('summary.md', 'utf8').slice(0, 60000);
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
