@@ -210,6 +210,9 @@ data "aws_iam_policy_document" "apply" {
       "cloudfront:ListCachePolicies",
       "cloudfront:GetResponseHeadersPolicy",
       "cloudfront:ListResponseHeadersPolicies",
+      "cloudfront:CreateResponseHeadersPolicy",
+      "cloudfront:UpdateResponseHeadersPolicy",
+      "cloudfront:DeleteResponseHeadersPolicy",
     ]
     resources = ["*"]
   }

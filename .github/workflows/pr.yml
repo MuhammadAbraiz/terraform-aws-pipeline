@@ -20,7 +20,7 @@ env:
 
 jobs:
   checks:
-    name: fmt, validate, scan code
+    name: fmt + validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,6 +42,18 @@ jobs:
         run: |
           terraform init -backend=false -lockfile=readonly -no-color > /dev/null
           terraform validate -no-color
+
+  # Runs beside the plan, not before it: a finding here should not hide
+  # the plan from the reviewer. Both scans must pass before merge.
+  scan-code:
+    name: scan code
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Checkov (code)
         run: |
